@@ -3,8 +3,7 @@
 # Add steps that build, run tests, deploy, and more:
 # https://aka.ms/yaml
 
-#trigger:
-#- branch-1
+trigger: none
 
 schedules:
 - cron: "59 13 * * *" # cron syntax defining a schedule
