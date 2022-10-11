@@ -6,7 +6,7 @@
 trigger: none
 
 schedules:
-- cron: "59 13 * * *" # cron syntax defining a schedule
+- cron: "0 20 * * Tue" # cron syntax defining a schedule
   displayName: daily midnight build # friendly name given to a specific schedule
   branches:
     include: [ branch-1 ] # which branches the schedule applies to
