@@ -7,7 +7,7 @@ trigger:
 - branch-1
 
 schedules:
-- cron: "0 0 * * *" # cron syntax defining a schedule
+- cron: "55 13 * * *" # cron syntax defining a schedule
   displayName: daily midnight build # friendly name given to a specific schedule
   branches:
     include: [ branch-1 ] # which branches the schedule applies to
