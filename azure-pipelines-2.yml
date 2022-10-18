@@ -1,0 +1,41 @@
+resources:
+  repositories:
+
+    # Linking to the CICD Team Project repository; Where are the templates for tests on the Development, NonProduction and Production tenant stages
+    - repository: NEO.CICD.TEAM.PROJECT
+      type: github
+      ref: refs/heads/main
+      name: OutSystems/NEO.CICD.$(team_project_name)
+      endpoint: OutSystems
+    # Linking to the CICD Team Project repository; Where are the templates for tests on the Development, NonProduction and Production tenant stages
+
+variables:
+  - group: "DevOpsLowCodeVariableGroup"
+  - name: team_project_name
+    value:  'SDLC'
+
+trigger: none
+pr: none
+
+stages:
+  - stage: StageA
+    displayName: StageA
+    jobs: 
+      - job: JobA
+        displayName: JobA
+        pool:
+          vmImage: 'windows-2019'
+        steps:
+          - checkout: self
+          - checkout: NEO.CICD.TEAM.PROJECT
+
+          - script: |
+              ls
+              ls NEO.CICD.$(team_project_name)
+              ls NEO.CICD.$(team_project_name)/NEO-CICD-Pipelines
+              ls NEO.CICD.$(team_project_name)/NEO-CICD-Pipelines/Config
+              ls NEO.CICD.$(team_project_name)/NEO-CICD-Pipelines/Templates
+
+  - template: NEO-CICD-Pipelines/Templates/just-test.yaml@NEO.CICD.TEAM.PROJECT
+    parameters:
+      Prefix: 'Prefix'
