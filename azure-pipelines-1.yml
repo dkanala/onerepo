@@ -1,0 +1,27 @@
+---
+parameters:
+- name: Prefix
+  type: string
+  default: ''
+
+stages:
+  ####################################
+  #        TestsDevelopment          #
+  ####################################
+  - stage: StageTestsDevelopment
+    displayName: Tests
+    jobs:
+      - job: dev_BDDTests_${{ parameters.Prefix }}
+        displayName: Non Prod BDD Tests - ${{ parameters.Prefix }}
+        pool:
+          vmImage: 'windows-2019'
+        steps:
+          - checkout: none
+
+          - task: PowerShell@2
+            inputs:
+              targetType: 'inline'
+              script: | 
+                echo "Here we will run BDD tests."
+            displayName: BDD Tests - ${{ parameters.Prefix }}
+...
