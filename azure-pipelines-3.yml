@@ -1,0 +1,733 @@
+parameters:
+    - name: destroy
+      type: boolean
+      default: false
+  
+  
+  trigger:
+    branches:
+      include:
+      - develop
+      - master
+      - feature/*
+      - bug/*
+      - hotfix/*
+    paths:
+      include:
+      - terraform/modules/policy-assignments/*
+      - terraform/modules/policy-remediations/*
+      - terraform/modules/policy-definitions/*
+      - terraform/modules/policyset-definitions/*
+      - terraform/governance_policy/*
+      - terraform/governance_policy_roles/*
+      - terraform/configuration/*/governance-policy.tfvars
+  
+  variables:
+    - group: SubscriptionNames
+  
+  pool:
+    vmImage: 'ubuntu-latest'
+  
+  stages:
+  - stage: PreCheck
+    displayName: 'PreCheck'
+    jobs:
+      - template: templates\lint-jobs.yaml
+        parameters:
+          markdownlintEnabled: true
+  
+  #################################################################
+  #
+  # CloudBlox_Sandbox
+  #
+  #################################################################
+  
+  - stage: CloudBlox_Sandbox
+    displayName: CloudBlox Sandbox
+    dependsOn:
+    - PreCheck
+    condition: |
+      or
+      (
+        and(succeeded(), eq(variables['build.sourceBranch'], 'refs/heads/develop')),
+        and(succeeded(), contains(variables['Build.SourceBranch'], 'refs/heads/feature')),
+        and(succeeded(), contains(variables['Build.SourceBranch'], 'refs/heads/bug'))
+      ) 
+    jobs:
+      - job: CloudBlox_Sandbox
+        displayName: Start CloudBlox_Sandbox deployments
+  
+  
+  - stage: Apply_CloudBlox_Sandbox
+    displayName: Apply_CloudBlox_Sandbox
+    dependsOn:
+    - CloudBlox_Sandbox
+    condition: and( succeeded(), eq(${{parameters.destroy}}, false))
+    jobs:
+      - job: Apply_CloudBlox_Sandbox
+        displayName: Apply CloudBlox_Sandbox
+  
+  
+  - stage: MG_FI_PolicySandbox_Apply
+    displayName: 'MG-FI-PolicySandbox - Terraform Apply'
+    dependsOn:
+    - Apply_CloudBlox_Sandbox  
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'dev'
+            name_prefix: MG_FI_PolicySandbox_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-policysandbox/governance-policy.tfvars'
+            terraform_state_file: 'mgfipolicysandbox-policy.state'
+            variable_groups:
+              - FI-AZ-PolicySandbox-TF-SP
+              - ServiceConnectionNames       
+  
+  - stage: MG_FI_PolicySandbox_Remove_ASC_Default
+    displayName: 'MG-FI-PolicySandbox - Remove ASC Default'
+    dependsOn:
+    - MG_FI_PolicySandbox_Apply  
+    jobs:            
+      - job: remove_asc_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-PolicySandbox-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-PolicySandbox"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true  
+  
+  - stage: MG_FI_LandingZoneDev_Apply
+    displayName: 'MG-FI-LandingZoneDev - Terraform Apply'
+    dependsOn:
+    - MG_FI_PolicySandbox_Apply 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'test'
+            name_prefix: MG_FI_LandingZoneDev_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-landingzonedev/governance-policy.tfvars'
+            terraform_state_file: 'mgfilandingzonedev-policy.state'
+            variable_groups:
+              - FI-AZ-LZDev-TF-SP
+              - ServiceConnectionNames
+  
+  
+  - stage: MG_FI_Dev_Sandbox_Output_Parse
+    displayName: 'Parse output from previous stage'
+    dependsOn:
+    - MG_FI_LandingZoneDev_Apply
+    - MG_FI_PolicySandbox_Apply
+    jobs:
+      - job: set_cli_params
+        displayName: Echo terraform stage output
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              itemPattern: '*/*_terraform_output.json'
+              targetPath: $(Build.SourcesDirectory)
+          - task: Bash@3
+            name: setclivariable
+            displayName: 'Echo stage output variable'
+            inputs:
+              workingDirectory: $(Build.SourcesDirectory)
+              targetType: inline
+              script: |
+                TERRAFORM_OUTPUTS=$(cat */*_terraform_output.json)
+                MANAGED_IDENTITIES=$(echo $TERRAFORM_OUTPUTS | jq '.dns_integration_assignment_managed_identity.value' | jq -s add -c)
+                CLI_PARAMS=-var=\'dns_integration_assignment_managed_identity=$MANAGED_IDENTITIES\'
+                echo $CLI_PARAMS
+                echo "##vso[task.setvariable variable=terraform_cli_params;isOutput=true]$CLI_PARAMS"
+  
+  # ls -la
+  # TERRAFORM_OUTPUTS=$(cat */*_terraform_output.json)
+  # MANAGED_IDENTITIES="dns_integration_assignment_managed_identity=$(echo $TERRAFORM_OUTPUTS | jq '.dns_integration_assignment_managed_identity.value' | jq -s add -c)"
+  # CLI_PARAMS=-var=\'$MANAGED_IDENTITIES\'
+  # echo $MANAGED_IDENTITIES
+  # echo $CLI_PARAMS
+  # echo "##vso[task.setvariable variable=terraform_cli_params;isOutput=true]$CLI_PARAMS"
+  
+  
+  - stage: MG_FI_Dev_Sandbox_Roles_Apply
+    displayName: 'MG-FI-LandingZoneDev and PolicySandbox - Apply Roles'
+    dependsOn:
+    - MG_FI_Dev_Sandbox_Output_Parse
+    variables:
+      terraform_cli_params: $[ stageDependencies.MG_FI_Dev_Sandbox_Output_Parse.set_cli_params.outputs['setclivariable.terraform_cli_params'] ]
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'test'
+            name_prefix: MG_FI_Platform_Roles_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy_roles'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-platform/governance-policy.tfvars'
+            terraform_state_file: 'mgfiplatform-roles-test-policy.state'
+            #terraform_cli_params: $[stageDependencies.MG_FI_Dev_Sandbox_Output_Parse.set_cli_params.outputs['setclivariable.terraform_cli_params']]
+            terraform_cli_params: '${{ variables.terraform_cli_params }}'
+            variable_groups:
+              - FI-AZ-Platform-TF-SP
+              - ServiceConnectionNames
+  
+  
+  - stage: MG_FI_LandingZoneDev_Remove_ASC_Default
+    displayName: 'MG-FI-LandingZoneDev - Remove ASC Default'
+    dependsOn:
+    - MG_FI_LandingZoneDev_Apply  
+    jobs: 
+      - job: remove_acs_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-LZDev-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-LandingZoneDev"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true             
+  # Destroy
+  
+  - stage: Destroy_CloudBlox_Sandbox
+    displayName: Destroy_CloudBlox_Sandbox
+    dependsOn:
+    - CloudBlox_Sandbox
+    condition: and( succeeded(), eq(${{parameters.destroy}}, true))
+    jobs:
+      - job: Destroy_CloudBlox_Sandbox
+        displayName: Destroy CloudBlox_Sandbox
+  
+  
+  - stage: MG_FI_PolicySandbox_Destroy
+    displayName: 'MG-FI-PolicySandbox - Terraform Destroy'
+    dependsOn:
+    - Destroy_CloudBlox_Sandbox  
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'dev'
+            name_prefix: MG_FI_PolicySandbox_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-policysandbox/governance-policy.tfvars'
+            terraform_state_file: 'mgfipolicysandbox-policy.state'
+            variable_groups:
+              - FI-AZ-PolicySandbox-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_LandingZoneDev_Destroy
+    displayName: 'MG-FI-LandingZoneDev - Terraform Destroy'
+    dependsOn:
+    - MG_FI_PolicySandbox_Destroy 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'test'
+            name_prefix: MG_FI_LandingZoneDev_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-landingzonedev/governance-policy.tfvars'
+            terraform_state_file: 'mgfilandingzonedev-policy.state'
+            variable_groups:
+              - FI-AZ-LZDev-TF-SP
+              - ServiceConnectionNames
+       
+  
+  #################################################################
+  #
+  # CloudBlox
+  #
+  #################################################################
+  
+  - stage: CloudBlox
+    displayName: CloudBlox
+    dependsOn:
+    - PreCheck
+    condition: |
+      or
+      (
+        and(succeeded(), contains(variables['Build.SourceBranch'], 'refs/heads/master')),
+        and(succeeded(), contains(variables['Build.SourceBranch'], 'refs/heads/hotfix'))
+      ) 
+    jobs:
+      - job: CloudBlox
+        displayName: Start CloudBlox_deployments
+  
+  - stage: Apply_CloudBlox
+    displayName: Apply CloudBlox
+    dependsOn:
+    - CloudBlox
+    condition: and( succeeded(), eq(${{parameters.destroy}}, false))
+    jobs:
+      - job: Apply_CloudBlox
+        displayName: Apply CloudBlox
+  
+  - stage: MG_FI_Platform_Apply
+    displayName: 'MG-FI-Platform - Terraform Apply'
+    dependsOn:
+    - Apply_CloudBlox 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Platform_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-platform/governance-policy.tfvars'
+            terraform_state_file: 'mgfiplatform-policy.state'
+            variable_groups:
+              - FI-AZ-Platform-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Platform_Remove_ASC_Default
+    displayName: 'MG-FI-Platform - Remove ASC Default'
+    dependsOn:
+    - MG_FI_Platform_Apply  
+    jobs:             
+      - job: remove_acs_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-Platform-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-Platform"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true 
+  
+  - stage: MG_FI_LandingZone_Apply
+    displayName: 'MG-FI-LandingZone - Terraform Apply'
+    dependsOn:
+    - MG_FI_Platform_Apply 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_LandingZone_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-landingzone/governance-policy.tfvars'
+            terraform_state_file: 'mgfilandingzone-policy.state'
+            variable_groups:
+              - FI-AZ-LandingZone-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_LandingZone_Remove_ASC_Default
+    displayName: 'MG-FI-LandingZone - Remove ASC Default'
+    dependsOn:
+    - MG_FI_LandingZone_Apply  
+    jobs:             
+      - job: remove_acs_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-LandingZone-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-LandingZone"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true 
+  
+  - stage: MG_FI_Decommissioned_Apply
+    displayName: 'MG-FI-Decommissioned - Terraform Apply'
+    dependsOn:
+    - MG_FI_Platform_Apply 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Decommissioned_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-decommissioned/governance-policy.tfvars'
+            terraform_state_file: 'mgfidecommissioned-policy.state'
+            variable_groups:
+              - FI-AZ-Decommissioned-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Decommissioned_Remove_ASC_Default
+    displayName: 'MG-FI-Decommissioned - Remove ASC Default'
+    dependsOn:
+    - MG_FI_Decommissioned_Apply  
+    jobs:             
+      - job: remove_acs_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-Decommissioned-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-Decommissioned"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true 
+  
+  - stage: MG_FI_Legacy_Apply
+    displayName: 'MG-FI-Legacy - Terraform Apply'
+    dependsOn:
+    - MG_FI_Platform_Apply 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Legacy_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-legacy/governance-policy.tfvars'
+            terraform_state_file: 'mgfilegacy-policy.state'
+            variable_groups:
+              - FI-AZ-Legacy-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Legacy_Remove_ASC_Default
+    displayName: 'MG-FI-Legacy - Remove ASC Default'
+    dependsOn:
+    - MG_FI_Legacy_Apply  
+    jobs:             
+      - job: remove_asc_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-Legacy-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-Legacy"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true 
+  
+  - stage: MG_FI_Product_Apply
+    displayName: 'MG-FI-Product - Terraform Apply'
+    dependsOn:
+    - MG_FI_Platform_Apply 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Product_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-product/governance-policy.tfvars'
+            terraform_state_file: 'mgfiproduct-policy.state'
+            variable_groups:
+              - FI-AZ-Product-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Product_Remove_ASC_Default
+    displayName: 'MG-FI-Product - Remove ASC Default'
+    dependsOn:
+    - MG_FI_Product_Apply  
+    jobs:             
+      - job: remove_asc_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-Product-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-Product"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true 
+  
+  - stage: MG_FI_Sandbox_Apply
+    displayName: 'MG-FI-Sandbox - Terraform Apply'
+    dependsOn:
+    - MG_FI_Platform_Apply 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Sandbox_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-sandbox/governance-policy.tfvars'
+            terraform_state_file: 'mgfisandbox-policy.state'
+            variable_groups:
+              - FI-AZ-Sandbox-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Sandbox_Remove_ASC_Default
+    displayName: 'MG-FI-Sandbox - Remove ASC Default'
+    dependsOn:
+    - MG_FI_Sandbox_Apply  
+    jobs:             
+      - job: remove_asc_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-Sandbox-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-Sandbox"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true   
+  
+  - stage: MG_FI_IntegrationPlatform_Apply
+    displayName: 'MG-FI-IntegrationPlatform - Terraform Apply'
+    dependsOn:
+    - MG_FI_Platform_Apply 
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_IntegrationPlatform_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-integrationplatform/governance-policy.tfvars'
+            terraform_state_file: 'mgfiintegrationplatform-policy.state'
+            variable_groups:
+              - FI-AZ-IntegrationPlatform-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_IntegrationPlatform_Remove_ASC_Default
+    displayName: 'MG-FI-IntegrationPlatform - Remove ASC Default'
+    dependsOn:
+    - MG_FI_IntegrationPlatform_Apply  
+    jobs:             
+      - job: remove_asc_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-IntegrationPlatform-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-IntegrationPlatform"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true
+  
+  - stage: MG_FI_DataPlatform_Apply
+    displayName: 'MG-FI-DataPlatform - Terraform Apply'
+    dependsOn:
+    - MG_FI_Platform_Apply
+    jobs:
+      - template: templates\terraform-apply-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_DataPlatform_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-dataplatform/governance-policy.tfvars'
+            terraform_state_file: 'mgfidataplatform-policy.state'
+            variable_groups:
+              - FI-AZ-Dataplatform-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_DataPlatform_Remove_ASC_Default
+    displayName: 'MG-FI-DataPlatform - Remove ASC Default'
+    dependsOn:
+    - MG_FI_DataPlatform_Apply  
+    jobs:             
+      - job: remove_asc_default
+        displayName: Remove ASC Default assignment from subscriptions.
+        variables:
+          - group: FI-AZ-Dataplatform-TF-SP      
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: PowerShell@2
+            inputs:
+              targetType: 'filePath'
+              filePath: $(Build.SourcesDirectory)/scripts/Remove-ASCDefaultPolicyAssignment.ps1
+              arguments: > 
+                -username $(sp-client-id)
+                -password $(sp-client-secret)
+                -tenant $(sp-tenant-id)
+                -mg "MG-FI-DataPlatform"
+              displayName: 'Remove ASC Default from subscriptions script'
+              workingDirectory: $(Build.SourcesDirectory)/scripts
+              failOnStderr: true   
+  
+  # Destroy
+  
+  - stage: Destroy_CloudBlox
+    displayName: Destroy CloudBlox
+    dependsOn:
+    - CloudBlox
+    condition: and( succeeded(), eq(${{parameters.destroy}}, true))
+    jobs:
+      - job: Destroy_CloudBlox
+        displayName: Destroy CloudBlox
+  
+  - stage: MG_FI_Platform_Destroy
+    displayName: 'MG-FI-Platform - Terraform Destroy'
+    dependsOn:
+    - Destroy_CloudBlox 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Platform_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-platform/governance-policy.tfvars'
+            terraform_state_file: 'mgfiplatform-policy.state'
+            variable_groups:
+              - FI-AZ-Platform-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_LandingZone_Destroy
+    displayName: 'MG-FI-LandingZone - Terraform Destroy'
+    dependsOn:
+    - MG_FI_Platform_Destroy 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_LandingZone_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-landingzone/governance-policy.tfvars'
+            terraform_state_file: 'mgfilandingzone-policy.state'
+            variable_groups:
+              - FI-AZ-LandingZone-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Decommissioned_Destroy
+    displayName: 'MG-FI-Decommissioned - Terraform Destroy'
+    dependsOn:
+    - MG_FI_Platform_Destroy 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Decommissioned_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-decommissioned/governance-policy.tfvars'
+            terraform_state_file: 'mgfidecommissioned-policy.state'
+            variable_groups:
+              - FI-AZ-Decommissioned-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Legacy_Destroy
+    displayName: 'MG-FI-Legacy - Terraform Destroy'
+    dependsOn:
+    - MG_FI_Platform_Destroy 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Legacy_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-legacy/governance-policy.tfvars'
+            terraform_state_file: 'mgfilegacy-policy.state'
+            variable_groups:
+              - FI-AZ-Legacy-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Product_Destroy
+    displayName: 'MG-FI-Product - Terraform Destroy'
+    dependsOn:
+    - MG_FI_Platform_Destroy 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Product_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-product/governance-policy.tfvars'
+            terraform_state_file: 'mgfiproduct-policy.state'
+            variable_groups:
+              - FI-AZ-Product-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_Sandbox_Destroy
+    displayName: 'MG-FI-Sandbox - Terraform Destroy'
+    dependsOn:
+    - MG_FI_Platform_Destroy 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_Sandbox_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-sandbox/governance-policy.tfvars'
+            terraform_state_file: 'mgfisandbox-policy.state'
+            variable_groups:
+              - FI-AZ-Sandbox-TF-SP
+              - ServiceConnectionNames
+  
+  - stage: MG_FI_IntegrationPlatform_Destroy
+    displayName: 'MG-FI-IntegrationPlatform - Terraform Destroy'
+    dependsOn:
+    - MG_FI_Platform_Destroy 
+    jobs:
+      - template: templates\terraform-destroy-jobs.yml
+        parameters:
+            environment: 'prod'
+            name_prefix: MG_FI_IntegrationPlatform_
+            workingdirectory: '$(Build.SourcesDirectory)/terraform/governance_policy'
+            tfvars: '$(Build.SourcesDirectory)/terraform/configuration/mg-fi-integrationplatform/governance-policy.tfvars'
+            terraform_state_file: 'mgfiintegrationplatform-policy.state'
+            variable_groups:
+              - FI-AZ-IntegrationPlatform-TF-SP
+              - ServiceConnectionNames
